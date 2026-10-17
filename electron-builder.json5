@@ -1,0 +1,62 @@
+{
+  "appId": "com.electron.port-forwarder",
+  "productName": "Tunnel Proxy",
+  "copyright": "Copyright © 2024 ${author}",
+  "asar": true,
+  "directories": {
+    "output": "release/${version}"
+  },
+  "files": [
+    "dist-electron",
+    "dist"
+  ],
+  // 托盘 / 窗口图标靠这里进包：主进程 getResourcePath() 在打包后读 process.resourcesPath/icons/*
+  // 缺了这段，打包版启动时 new Tray() 会失败，进而连带跳过规则自动恢复与重连定时器
+  "extraResources": [
+    {
+      "from": "src/assets/icons",
+      "to": "icons",
+      "filter": ["**/*"]
+    }
+  ],
+  "mac": {
+    "artifactName": "${productName}_${version}.${ext}",
+    "target": ["dmg"]
+  },
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ],
+    "artifactName": "${productName}_${version}.${ext}",
+    "icon": "build/icon.ico",
+    "requestedExecutionLevel": "requireAdministrator"
+  },
+  "linux": {
+    "icon": "src/assets/icons",
+    "category": "Network",
+    "target": [
+      {
+        "target": "deb",
+        "arch": ["x64"]
+      },
+      {
+        "target": "AppImage",
+        "arch": ["x64"]
+      }
+    ],
+    "artifactName": "tunnel-proxy_${version}_${arch}.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "Tunnel Proxy"
+  },
+  "publish": null
+} 
