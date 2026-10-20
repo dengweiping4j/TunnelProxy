@@ -20,6 +20,8 @@ export default defineConfig({
               entry: {
                 main: 'electron/main.js',
                 logger: 'electron/logger.js',
+                // 同 logger：保证 dist-electron/mailer.js 存在（开发和打包都依赖它）
+                mailer: 'electron/mailer.js',
               },
             },
           },

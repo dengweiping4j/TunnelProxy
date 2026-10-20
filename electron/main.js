@@ -6,6 +6,7 @@ const fs = require('fs')
 const { Client } = require('ssh2')
 const Store = require('electron-store')
 const logger = require('./logger')
+const mailer = require('./mailer')
 
 // 提前设置单实例锁，避免二次实例瞬退导致“自动退出”的错觉
 const gotTheLock = app.requestSingleInstanceLock()
@@ -61,8 +62,8 @@ const forwardingServers = new Map()
 const reverseSshProcesses = new Map()
 const sshClients = new Map()
 
-// 断线重连阶梯：第 1 次 5 分钟，之后 30 / 60 / 360 分钟，360 分钟后固定 360 分钟
-const RETRY_LADDER_MINUTES = [5, 30, 60, 360]
+// 断线重连阶梯：第 1 次 1 分钟，之后 5 / 10 / 30 分钟，登顶后一直按 30 分钟重试
+const RETRY_LADDER_MINUTES = [1, 5, 10, 30]
 // 用固定周期 tick 检查到期，而不是挂一串长定时器：休眠唤醒后漏掉的计划也不会丢
 const RETRY_TICK_MS = 30 * 1000
 const retryQueue = new Map() // id -> { attempts, nextAt }
@@ -366,8 +367,11 @@ app.whenReady().then(() => {
     }
   });
 
-  // 启动重连调度（断线后的 5/30/60/360 分钟重试由它驱动）
+  // 启动重连调度（断线后的 1/5/10/30 分钟重试由它驱动，30 分钟后固定 30 分钟）
   startRetryTimer();
+
+  // 启动健康监控（每 5 分钟检查一次，本轮新增异常合并成一封告警邮件）
+  startHealthMonitor();
 });
 
 // 单实例逻辑已提前处理（见文件顶部）
@@ -528,6 +532,94 @@ const startRetryTimer = () => {
     }
   }, RETRY_TICK_MS);
 };
+
+// ---- 服务健康监控：每 5 分钟扫一遍规则，本轮新增的异常合并成一封告警邮件 ----
+
+const HEALTH_CHECK_MS = 5 * 60 * 1000
+// id -> 本次异常是否已发过告警邮件；服务恢复正常后清除，下次异常才会再发
+const alertNotified = new Map()
+let healthTimer = null
+// 防重入：上一轮还没发完（SMTP 慢）时，本轮直接跳过，避免重复发信
+let healthChecking = false
+
+const ruleTypeLabel = (rule) => (rule.type === 'reverse-ssh' ? '反向 SSH' : '正向转发')
+
+// 把「本轮新增的异常」拼成一封邮件的标题与正文
+// newly: 本轮需要告警的规则；abnormalTotal / ruleTotal: 用于说明当前整体情况
+const buildAlertMail = (newly, abnormalTotal, ruleTotal) => {
+  const count = newly.length
+  const subject =
+    count === 1
+      ? `[TunnelProxy] 转发服务异常: ${newly[0].id}`
+      : `[TunnelProxy] 转发服务异常告警（${count} 项）`
+
+  const blocks = newly.map((rule, i) => {
+    const head = count > 1 ? `${i + 1}. ` : ''
+    return [
+      `${head}规则: ${rule.id}`,
+      `${count > 1 ? '   ' : ''}类型: ${ruleTypeLabel(rule)}`,
+      `${count > 1 ? '   ' : ''}状态: ${rule.status}`,
+      `${count > 1 ? '   ' : ''}错误: ${rule.error || '无'}`
+    ].join('\n')
+  })
+
+  const lines = [
+    count === 1
+      ? 'TunnelProxy 检测到 1 项转发服务异常：'
+      : `TunnelProxy 检测到 ${count} 项转发服务异常：`,
+    '',
+    blocks.join('\n\n'),
+    '',
+    `当前异常规则 ${abnormalTotal} 条，规则总数 ${ruleTotal} 条。`,
+    `检测时间: ${new Date().toLocaleString()}`,
+    `日志目录: ${logger.getDir() || '未启用'}`
+  ]
+
+  return { subject, text: lines.join('\n') }
+}
+
+const checkServiceHealth = async () => {
+  if (healthChecking) return
+  healthChecking = true
+  try {
+    const rules = store.get('forwardings') || []
+    const abnormal = [] // 当前所有异常规则（含已告警过的）
+    const pending = [] // 其中还没告警过的，本次要发的
+
+    for (const rule of rules) {
+      // 用户主动停止 / 运行中 = 正常：顺手清标记，下次异常才会重新发告警
+      if (rule.desired !== 'running' || rule.status === 'running') {
+        alertNotified.delete(rule.id)
+        continue
+      }
+      // 剩下的是异常态（error 等，含断线排队等重连中）
+      abnormal.push(rule)
+      if (!alertNotified.has(rule.id)) pending.push(rule)
+    }
+
+    if (pending.length === 0) return
+
+    // 多个异常同时出现只发一封邮件，内容逐条列出
+    const { subject, text } = buildAlertMail(pending, abnormal.length, rules.length)
+    // 只有发送成功才标记已发；失败则下个周期自动重试，避免邮件丢了就不再提醒
+    const sent = await mailer.sendAlert({ subject, text })
+    if (!sent) return
+
+    pending.forEach((rule) => alertNotified.set(rule.id, true))
+    logger.lifecycle(
+      `已发送异常告警邮件（${pending.length} 项）: ${pending.map((r) => r.id).join(', ')}`
+    )
+  } finally {
+    healthChecking = false
+  }
+}
+
+const startHealthMonitor = () => {
+  if (healthTimer) return
+  healthTimer = setInterval(() => {
+    checkServiceHealth().catch(err => console.error('健康检查失败:', err))
+  }, HEALTH_CHECK_MS)
+}
 
 // 创建一个辅助函数来启动转发
 const startForwarding = (params, event = null, isRetry = false) => {
@@ -1055,6 +1147,12 @@ app.on('before-quit', (event) => {
       retryTimer = null
     }
     retryQueue.clear()
+
+    // 停止健康监控，避免退出过程中还尝试发邮件
+    if (healthTimer) {
+      clearInterval(healthTimer)
+      healthTimer = null
+    }
 
     // 销毁托盘图标
     if (tray) {
